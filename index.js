@@ -13,72 +13,37 @@ app.use(cors({ origin: process.env.FRONTEND_URL || "*" }));
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
-// ── Parse expense with Claude ──────────────────────────────────────────────
-async function parseExpense(text) {
+// ── Parse one or many expenses with Claude ────────────────────────────────
+async function parseExpenses(text) {
   const msg = await anthropic.messages.create({
     model: "claude-haiku-4-5-20251001",
-    max_tokens: 256,
+    max_tokens: 1024,
     messages: [
       {
         role: "user",
-        content: `You parse expense messages. Return ONLY a JSON object, no markdown, no explanation.
+        content: `You parse expense messages. The message may contain ONE or MULTIPLE expenses separated in ANY way — new lines, commas, full stops, semicolons, pipes, dashes, or any other separator. Use context and amounts to identify individual expenses.
+Return ONLY a JSON array, no markdown, no explanation.
 
-Schema: {"amount": <number>, "description": "<2-4 word label>", "category": "<one of: Food, Transport, Shopping, Entertainment, Health, Bills, Other>", "paid_by": "<name if mentioned, else null>"}
+Each item in the array must follow this schema:
+{"amount": <number>, "description": "<2-4 word label>", "category": "<one of: Food, Transport, Shopping, Entertainment, Health, Bills, Other>", "paid_by": "<name if mentioned, else null>"}
 
 Rules:
 - amount must be a positive number in INR
-- If not an expense, return {"error": "not an expense"}
 - description must be short and clean
+- Split smartly — "500 groceries, 299 netflix, 100 coffee" is 3 expenses
+- Skip anything that is clearly not an expense
+- If nothing is an expense at all, return []
+- Always return an array, even for a single expense
 
-Message: "${text}"`,
+Message:
+${text}`,
       },
     ],
   });
 
   const raw = msg.content[0].text.trim().replace(/```json|```/g, "").trim();
-  return JSON.parse(raw);
-}
-
-// ── Build WhatsApp reply ───────────────────────────────────────────────────
-async function buildReply(parsed, groupId) {
-  const { data: limits } = await supabase
-    .from("limits")
-    .select("*")
-    .eq("group_id", groupId);
-
-  const { data: txns } = await supabase
-    .from("transactions")
-    .select("amount, category")
-    .eq("group_id", groupId)
-    .gte("created_at", new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString());
-
-  const totalSpent = (txns || []).reduce((s, t) => s + t.amount, 0);
-  const catSpent = (txns || [])
-    .filter((t) => t.category === parsed.category)
-    .reduce((s, t) => s + t.amount, 0);
-
-  const overallLimit = (limits || []).find((l) => l.category === "overall");
-  const catLimit = (limits || []).find((l) => l.category === parsed.category);
-
-  let reply = `✅ *₹${parsed.amount.toLocaleString("en-IN")}* recorded for ${parsed.description} (${parsed.category})`;
-
-  if (catLimit) {
-    const rem = catLimit.amount - catSpent;
-    reply +=
-      rem < 0
-        ? `\n\n⚠️ *${parsed.category} limit exceeded* by ₹${Math.abs(rem).toLocaleString("en-IN")}`
-        : `\n\n📊 *${parsed.category}:* ₹${rem.toLocaleString("en-IN")} remaining of ₹${catLimit.amount.toLocaleString("en-IN")}`;
-  }
-
-  if (overallLimit) {
-    const remOverall = overallLimit.amount - totalSpent;
-    reply +=
-      remOverall < 0
-        ? `\n🚨 Monthly budget exceeded by ₹${Math.abs(remOverall).toLocaleString("en-IN")}`
-        : `\n💰 Monthly total: ₹${totalSpent.toLocaleString("en-IN")} / ₹${overallLimit.amount.toLocaleString("en-IN")}`;
-  }
-
-  return reply;
+  const parsed = JSON.parse(raw);
+  return Array.isArray(parsed) ? parsed : [parsed];
 }
 
 // ── Twilio WhatsApp webhook ────────────────────────────────────────────────
@@ -86,33 +51,86 @@ app.post("/webhook/whatsapp", async (req, res) => {
   const twiml = new twilio.twiml.MessagingResponse();
   const incomingMsg = (req.body.Body || "").trim();
   const from = req.body.From || "whatsapp:unknown";
-
-  // Derive a group_id from the sender (one group per number for now)
   const groupId = from.replace("whatsapp:", "").replace(/\D/g, "");
 
   try {
-    const parsed = await parseExpense(incomingMsg);
+    const expenses = await parseExpenses(incomingMsg);
 
-    if (parsed.error) {
+    if (!expenses.length) {
       twiml.message(
-        "Hmm, I couldn't read that as an expense.\n\nTry:\n• *200 rupees auto*\n• *paid 500 for groceries*\n• *netflix 299*"
+        "Hmm, I couldn't find any expenses in that message.\n\nTry:\n• *200 rupees auto*\n• *500 groceries*\n• Multiple at once:\n  100 coffee, 299 netflix, 800 groceries"
       );
     } else {
       // Upsert group
       await supabase.from("groups").upsert({ id: groupId, name: groupId }, { onConflict: "id", ignoreDuplicates: true });
 
-      // Insert transaction
-      await supabase.from("transactions").insert({
-        group_id: groupId,
-        amount: parsed.amount,
-        description: parsed.description,
-        category: parsed.category,
-        paid_by: parsed.paid_by || "Unknown",
-        raw_message: incomingMsg,
-      });
+      // Insert all expenses
+      await supabase.from("transactions").insert(
+        expenses.map((e) => ({
+          group_id: groupId,
+          amount: e.amount,
+          description: e.description,
+          category: e.category,
+          paid_by: e.paid_by || "Unknown",
+          raw_message: incomingMsg,
+        }))
+      );
 
-      const reply = await buildReply(parsed, groupId);
-      twiml.message(reply);
+      // Fetch fresh totals + limits after insert
+      const { data: limits } = await supabase.from("limits").select("*").eq("group_id", groupId);
+      const { data: txns } = await supabase
+        .from("transactions")
+        .select("amount, category")
+        .eq("group_id", groupId)
+        .gte("created_at", new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString());
+
+      const totalSpent = (txns || []).reduce((s, t) => s + t.amount, 0);
+      const overallLimit = (limits || []).find((l) => l.category === "overall");
+
+      // Helper: total spent in a category this month
+      const catSpent = (cat) =>
+        (txns || []).filter((t) => t.category === cat).reduce((s, t) => s + t.amount, 0);
+
+      // Build reply — one line per expense + category balance if limit exists
+      const lines = [];
+      const seenCats = new Set();
+
+      for (const e of expenses) {
+        lines.push(`✅ *₹${e.amount.toLocaleString("en-IN")}* — ${e.description} (${e.category})`);
+
+        // Show category balance once per unique category in this message
+        if (!seenCats.has(e.category)) {
+          seenCats.add(e.category);
+          const catLimit = (limits || []).find((l) => l.category === e.category);
+          if (catLimit) {
+            const spent = catSpent(e.category);
+            const rem = catLimit.amount - spent;
+            lines.push(
+              rem < 0
+                ? `   ⚠️ ${e.category} limit exceeded by ₹${Math.abs(rem).toLocaleString("en-IN")}`
+                : `   📊 ${e.category}: ₹${rem.toLocaleString("en-IN")} left of ₹${catLimit.amount.toLocaleString("en-IN")}`
+            );
+          }
+        }
+      }
+
+      // Summary line for multi-expense messages
+      if (expenses.length > 1) {
+        const totalThisMsg = expenses.reduce((s, e) => s + e.amount, 0);
+        lines.push(`\n📦 *${expenses.length} recorded* · This batch: ₹${totalThisMsg.toLocaleString("en-IN")}`);
+      }
+
+      // Overall monthly budget
+      if (overallLimit) {
+        const rem = overallLimit.amount - totalSpent;
+        lines.push(
+          rem < 0
+            ? `🚨 Monthly budget exceeded by ₹${Math.abs(rem).toLocaleString("en-IN")}`
+            : `💰 Monthly: ₹${totalSpent.toLocaleString("en-IN")} / ₹${overallLimit.amount.toLocaleString("en-IN")} · ₹${rem.toLocaleString("en-IN")} left`
+        );
+      }
+
+      twiml.message(lines.join("\n"));
     }
   } catch (err) {
     console.error("Webhook error:", err);
@@ -124,7 +142,7 @@ app.post("/webhook/whatsapp", async (req, res) => {
 
 // ── REST API for dashboard ─────────────────────────────────────────────────
 
-// GET /api/groups — list all groups
+// GET /api/groups
 app.get("/api/groups", async (req, res) => {
   const { data, error } = await supabase.from("groups").select("*").order("created_at", { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
@@ -153,16 +171,12 @@ app.post("/api/transactions", async (req, res) => {
   if (!group_id || !amount || !description || !category) {
     return res.status(400).json({ error: "Missing required fields" });
   }
-
-  // Upsert group
   await supabase.from("groups").upsert({ id: group_id, name: group_id }, { onConflict: "id", ignoreDuplicates: true });
-
   const { data, error } = await supabase
     .from("transactions")
     .insert({ group_id, amount: parseFloat(amount), description, category, paid_by: paid_by || "Unknown", raw_message: null })
     .select()
     .single();
-
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
@@ -182,7 +196,7 @@ app.get("/api/limits", async (req, res) => {
   res.json(data);
 });
 
-// POST /api/limits — set or update a limit
+// POST /api/limits
 app.post("/api/limits", async (req, res) => {
   const { group_id, category, amount } = req.body;
   const { data, error } = await supabase
