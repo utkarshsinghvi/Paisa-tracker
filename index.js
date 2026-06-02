@@ -258,6 +258,43 @@ app.get("/api/summary", async (req, res) => {
   res.json({ total, byCategory, byPerson, byDay, limits: limits || [], count: (txns || []).length });
 });
 
+// POST /api/insights
+app.post("/api/insights", async (req, res) => {
+  const { total, byCategory, limitsInfo, income, transactions, month } = req.body;
+
+  const topCats = Object.entries(byCategory||{}).sort((a,b)=>b[1]-a[1]).slice(0,5)
+    .map(([c,a]) => `${c}: ₹${Math.round(a).toLocaleString('en-IN')}`).join(', ');
+
+  const prompt = `You are a personal finance advisor analysing someone's spending data. Be specific, helpful, and direct. Use Indian Rupee (₹) for all amounts.
+
+Month: ${month}
+Total expenses: ₹${Math.round(total||0).toLocaleString('en-IN')}
+${income>0 ? `Monthly income: ₹${Math.round(income).toLocaleString('en-IN')}, Savings: ₹${Math.round(income-(total||0)).toLocaleString('en-IN')} (${Math.round(((income-(total||0))/income)*100)}%)` : 'Income not set'}
+Spending by category: ${topCats}
+${limitsInfo ? `Budget limits: ${limitsInfo}` : 'No budget limits set'}
+Recent transactions: ${(transactions||[]).slice(0,15).map(t=>`${t.description} ₹${t.amount}`).join(', ')}
+
+Generate exactly 4 financial insights as a JSON array. Each insight must be specific to THIS data.
+Return ONLY a JSON array, no markdown:
+[{"icon":"emoji","color":"hex color for background","title":"short title","body":"2-3 sentence specific insight with numbers"}]
+
+Make insights about: spending patterns, budget alerts, savings opportunities, trend observations. Be specific with numbers.`;
+
+  try {
+    const msg = await anthropic.messages.create({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 1000,
+      messages: [{ role: "user", content: prompt }]
+    });
+    const raw = msg.content[0].text.trim().replace(/```json|```/g, '').trim();
+    const insights = JSON.parse(raw);
+    res.json(insights);
+  } catch(err) {
+    console.error("Insights error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get("/health", (_, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3001;
