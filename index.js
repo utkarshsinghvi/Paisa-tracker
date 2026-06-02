@@ -174,7 +174,7 @@ app.post("/api/transactions", async (req, res) => {
   }
   await supabase.from("groups").upsert({ id: group_id, name: group_id }, { onConflict: "id", ignoreDuplicates: true });
   const insertData = { group_id, amount: parseFloat(amount), description, category, paid_by: paid_by || "Me", raw_message: null };
-  if (req.body.created_at) insertData.created_at = req.body.created_at;
+  if (req.body.created_at) insertData.transaction_date = req.body.created_at.slice(0,10);
   const { data, error } = await supabase
     .from("transactions")
     .insert(insertData)
@@ -186,14 +186,14 @@ app.post("/api/transactions", async (req, res) => {
 
 // PATCH /api/transactions/:id — edit description, amount, category, date
 app.patch("/api/transactions/:id", async (req, res) => {
-  const { description, amount, category, created_at } = req.body;
+  const { description, amount, category, transaction_date } = req.body;
   const updates = {};
   if (description) updates.description = description;
   if (amount) updates.amount = parseFloat(amount);
   if (category) updates.category = category;
-  if (created_at) updates.created_at = created_at;
+  if (transaction_date) updates.transaction_date = transaction_date;
   const { data, error } = await supabase.from("transactions").update(updates).eq("id", req.params.id).select().single();
-  if (error) return res.status(500).json({ error: error.message });
+  if (error) { console.error("PATCH error:", error); return res.status(500).json({ error: error.message }); }
   res.json(data);
 });
 
@@ -251,7 +251,7 @@ app.get("/api/summary", async (req, res) => {
   for (const t of txns || []) {
     byCategory[t.category] = (byCategory[t.category] || 0) + t.amount;
     byPerson[t.paid_by] = (byPerson[t.paid_by] || 0) + t.amount;
-    const day = t.created_at.slice(0, 10);
+    const day = (t.transaction_date || t.created_at).slice(0, 10);
     byDay[day] = (byDay[day] || 0) + t.amount;
   }
 
