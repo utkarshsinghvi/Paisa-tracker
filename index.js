@@ -31,6 +31,7 @@ Rules:
 - amount must be a positive number in INR
 - description must be short and clean
 - Split smartly — "500 groceries, 299 netflix, 100 coffee" is 3 expenses
+- "groceries", "sabzi", "vegetables", "fruits", "kirana", "supermarket", "BigBasket", "Zepto", "Blinkit", "Swiggy Instamart" always go to Food category
 - Skip anything that is clearly not an expense
 - If nothing is an expense at all, return []
 - Always return an array, even for a single expense
@@ -172,11 +173,26 @@ app.post("/api/transactions", async (req, res) => {
     return res.status(400).json({ error: "Missing required fields" });
   }
   await supabase.from("groups").upsert({ id: group_id, name: group_id }, { onConflict: "id", ignoreDuplicates: true });
+  const insertData = { group_id, amount: parseFloat(amount), description, category, paid_by: paid_by || "Me", raw_message: null };
+  if (req.body.created_at) insertData.created_at = req.body.created_at;
   const { data, error } = await supabase
     .from("transactions")
-    .insert({ group_id, amount: parseFloat(amount), description, category, paid_by: paid_by || "Unknown", raw_message: null })
+    .insert(insertData)
     .select()
     .single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// PATCH /api/transactions/:id — edit description, amount, category, date
+app.patch("/api/transactions/:id", async (req, res) => {
+  const { description, amount, category, created_at } = req.body;
+  const updates = {};
+  if (description) updates.description = description;
+  if (amount) updates.amount = parseFloat(amount);
+  if (category) updates.category = category;
+  if (created_at) updates.created_at = created_at;
+  const { data, error } = await supabase.from("transactions").update(updates).eq("id", req.params.id).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
