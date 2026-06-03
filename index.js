@@ -56,11 +56,12 @@ async function classifyIntent(text) {
       role: "user",
       content: `Classify this WhatsApp message intent. Return ONLY a JSON object, no markdown.
 
-Intents: "expense" | "edit" | "delete" | "show" | "unknown"
+Intents: "expense" | "edit" | "delete" | "show" | "query" | "unknown"
 
 For "edit": include field ("amount"|"description"|"category"|"paid_by"), value (new value), target ("last" or number)
 For "delete": include target ("last" or number like 2 for second-last)
 For "show": include count (default 5)
+For "query": any analytical/question about expenses — biggest, total, average, category breakdown, comparisons, how much spent, etc.
 
 Examples:
 "edit last to 300" -> {"intent":"edit","target":"last","field":"amount","value":"300"}
@@ -72,6 +73,11 @@ Examples:
 "edit last description to Uber" -> {"intent":"edit","target":"last","field":"description","value":"Uber"}
 "show last 5" -> {"intent":"show","count":5}
 "show expenses" -> {"intent":"show","count":5}
+"what is my biggest expense this month" -> {"intent":"query"}
+"how much have I spent on food" -> {"intent":"query"}
+"total spending this week" -> {"intent":"query"}
+"which category am I spending the most on" -> {"intent":"query"}
+"am I over budget" -> {"intent":"query"}
 "200 auto" -> {"intent":"expense"}
 "500 groceries, 299 netflix" -> {"intent":"expense"}
 
@@ -137,6 +143,55 @@ ${lines.join("
 ")}`;
 }
 
+// ── Handle natural language query ─────────────────────────────────────────
+async function handleQuery(question, groupId) {
+  // Fetch all transactions this month + limits
+  const now = new Date();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+  const [{ data: txns }, { data: limits }] = await Promise.all([
+    supabase.from("transactions").select("*").eq("group_id", groupId).gte("created_at", monthStart).order("created_at", { ascending: false }),
+    supabase.from("limits").select("*").eq("group_id", groupId),
+  ]);
+
+  if (!txns || !txns.length) return "No transactions found for this month yet.";
+
+  // Build context summary
+  const total = txns.reduce((s, t) => s + t.amount, 0);
+  const byCategory = {};
+  for (const t of txns) byCategory[t.category] = (byCategory[t.category] || 0) + t.amount;
+  const sorted = [...txns].sort((a, b) => b.amount - a.amount);
+  const catSummary = Object.entries(byCategory).sort((a,b) => b[1]-a[1])
+    .map(([c, a]) => `${c}: ₹${Math.round(a).toLocaleString("en-IN")}`).join(", ");
+  const limitsInfo = (limits || []).map(l => {
+    const spent = l.category === "overall" ? total : (byCategory[l.category] || 0);
+    const rem = l.amount - spent;
+    return `${l.category}: spent ₹${Math.round(spent).toLocaleString("en-IN")} of ₹${Math.round(l.amount).toLocaleString("en-IN")} (${rem >= 0 ? "₹"+Math.round(rem).toLocaleString("en-IN")+" left" : "over by ₹"+Math.round(-rem).toLocaleString("en-IN")})`;
+  }).join("; ");
+  const top10 = sorted.slice(0, 10).map(t =>
+    `${t.description}: ₹${t.amount.toLocaleString("en-IN")} (${t.category}, ${new Date(t.transaction_date||t.created_at).toLocaleDateString("en-IN",{day:"numeric",month:"short"})})`
+  ).join(", ");
+
+  const prompt = `You are a personal finance assistant. Answer this question about the user's expenses concisely in 2-4 lines. Use ₹ for amounts. Be specific with numbers.
+
+This month's data:
+- Total spent: ₹${Math.round(total).toLocaleString("en-IN")} across ${txns.length} transactions
+- By category: ${catSummary}
+- Top transactions: ${top10}
+${limitsInfo ? `- Budget limits: ${limitsInfo}` : ""}
+
+Question: ${question}
+
+Reply in plain text, no markdown, no bullet points. Keep it short and direct.`;
+
+  const msg = await anthropic.messages.create({
+    model: "claude-haiku-4-5-20251001",
+    max_tokens: 300,
+    messages: [{ role: "user", content: prompt }]
+  });
+
+  return `💬 ${msg.content[0].text.trim()}`;
+}
+
 // ── Twilio WhatsApp webhook ────────────────────────────────────────────────
 app.post("/webhook/whatsapp", async (req, res) => {
   const twiml = new twilio.twiml.MessagingResponse();
@@ -158,6 +213,10 @@ app.post("/webhook/whatsapp", async (req, res) => {
 
     } else if (intent.intent === "show") {
       const reply = await handleShow(intent, groupId);
+      twiml.message(reply);
+
+    } else if (intent.intent === "query") {
+      const reply = await handleQuery(incomingMsg, groupId);
       twiml.message(reply);
 
     } else if (intent.intent === "expense") {
@@ -235,7 +294,7 @@ app.post("/webhook/whatsapp", async (req, res) => {
 
     } else {
       twiml.message(
-        "I didn't understand that.\n\nYou can:\n• Log expenses: *200 auto*, *500 groceries*\n• Edit last: *edit last to 300*\n• Edit field: *edit last category to Food*\n• Delete: *delete last*\n• See recent: *show last 5*"
+        "I didn't understand that.\n\nYou can:\n• Log: *200 auto*, *500 groceries, 299 netflix*\n• Edit: *edit last to 300*\n• Edit field: *edit last category to Food*\n• Delete: *delete last*\n• List: *show last 5*\n• Ask anything: *biggest expense this month?*, *how much on food?*, *am I over budget?*"
       );
     }
 
