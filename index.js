@@ -137,10 +137,7 @@ async function handleShow(intent, groupId) {
     const date = new Date(t.transaction_date || t.created_at).toLocaleDateString("en-IN", { day: "numeric", month: "short" });
     return `${i + 1}. *₹${t.amount.toLocaleString("en-IN")}* — ${t.description} (${t.category}) · ${date}`;
   });
-  return `📋 *Last ${txns.length} transactions:*
-
-${lines.join("
-")}`;
+  return `📋 *Last ${txns.length} transactions:*\n\n${lines.join("\n")}`;
 }
 
 // ── Handle natural language query ─────────────────────────────────────────
