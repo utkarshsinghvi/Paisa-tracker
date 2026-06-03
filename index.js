@@ -47,6 +47,96 @@ ${text}`,
   return Array.isArray(parsed) ? parsed : [parsed];
 }
 
+// ── Classify message intent ───────────────────────────────────────────────
+async function classifyIntent(text) {
+  const msg = await anthropic.messages.create({
+    model: "claude-haiku-4-5-20251001",
+    max_tokens: 256,
+    messages: [{
+      role: "user",
+      content: `Classify this WhatsApp message intent. Return ONLY a JSON object, no markdown.
+
+Intents: "expense" | "edit" | "delete" | "show" | "unknown"
+
+For "edit": include field ("amount"|"description"|"category"|"paid_by"), value (new value), target ("last" or number)
+For "delete": include target ("last" or number like 2 for second-last)
+For "show": include count (default 5)
+
+Examples:
+"edit last to 300" -> {"intent":"edit","target":"last","field":"amount","value":"300"}
+"change last amount to 500" -> {"intent":"edit","target":"last","field":"amount","value":"500"}
+"delete last" -> {"intent":"delete","target":"last"}
+"remove last entry" -> {"intent":"delete","target":"last"}
+"delete second last" -> {"intent":"delete","target":2}
+"edit last category to food" -> {"intent":"edit","target":"last","field":"category","value":"Food"}
+"edit last description to Uber" -> {"intent":"edit","target":"last","field":"description","value":"Uber"}
+"show last 5" -> {"intent":"show","count":5}
+"show expenses" -> {"intent":"show","count":5}
+"200 auto" -> {"intent":"expense"}
+"500 groceries, 299 netflix" -> {"intent":"expense"}
+
+Message: "${text}"`
+    }]
+  });
+  const raw = msg.content[0].text.trim().replace(/\`\`\`json|\`\`\`/g, "").trim();
+  return JSON.parse(raw);
+}
+
+// ── Get recent transactions ────────────────────────────────────────────────
+async function getRecentTxns(groupId, limit = 10) {
+  const { data } = await supabase
+    .from("transactions")
+    .select("*")
+    .eq("group_id", groupId)
+    .order("created_at", { ascending: false })
+    .limit(limit);
+  return data || [];
+}
+
+// ── Handle edit ────────────────────────────────────────────────────────────
+async function handleEdit(intent, groupId) {
+  const txns = await getRecentTxns(groupId, 10);
+  if (!txns.length) return "No transactions found to edit.";
+  const idx = intent.target === "last" ? 0 : (parseInt(intent.target) - 1) || 0;
+  const txn = txns[idx];
+  if (!txn) return "Couldn't find that transaction.";
+  const updates = {};
+  if (intent.field === "amount") updates.amount = parseFloat(intent.value);
+  else if (intent.field === "description") updates.description = intent.value;
+  else if (intent.field === "category") updates.category = intent.value;
+  else if (intent.field === "paid_by") updates.paid_by = intent.value;
+  else return "Not sure what to edit. Try: *edit last amount to 300* or *edit last category to Food*";
+  await supabase.from("transactions").update(updates).eq("id", txn.id);
+  const fieldLabel = intent.field === "paid_by" ? "paid by" : intent.field;
+  return `✏️ Updated! *${txn.description}* — ${fieldLabel} changed to *${intent.value}*`;
+}
+
+// ── Handle delete ──────────────────────────────────────────────────────────
+async function handleDelete(intent, groupId) {
+  const txns = await getRecentTxns(groupId, 10);
+  if (!txns.length) return "No transactions found to delete.";
+  const idx = intent.target === "last" ? 0 : (parseInt(intent.target) - 1) || 0;
+  const txn = txns[idx];
+  if (!txn) return "Couldn't find that transaction.";
+  await supabase.from("transactions").delete().eq("id", txn.id);
+  return `🗑️ Deleted *${txn.description}* — ₹${txn.amount.toLocaleString("en-IN")} (${txn.category})`;
+}
+
+// ── Handle show ────────────────────────────────────────────────────────────
+async function handleShow(intent, groupId) {
+  const count = Math.min(intent.count || 5, 10);
+  const txns = await getRecentTxns(groupId, count);
+  if (!txns.length) return "No transactions found.";
+  const lines = txns.map((t, i) => {
+    const date = new Date(t.transaction_date || t.created_at).toLocaleDateString("en-IN", { day: "numeric", month: "short" });
+    return `${i + 1}. *₹${t.amount.toLocaleString("en-IN")}* — ${t.description} (${t.category}) · ${date}`;
+  });
+  return `📋 *Last ${txns.length} transactions:*
+
+${lines.join("
+")}`;
+}
+
 // ── Twilio WhatsApp webhook ────────────────────────────────────────────────
 app.post("/webhook/whatsapp", async (req, res) => {
   const twiml = new twilio.twiml.MessagingResponse();
@@ -55,84 +145,100 @@ app.post("/webhook/whatsapp", async (req, res) => {
   const groupId = from.replace("whatsapp:", "").replace(/\D/g, "");
 
   try {
-    const expenses = await parseExpenses(incomingMsg);
+    // Classify intent first
+    const intent = await classifyIntent(incomingMsg);
 
-    if (!expenses.length) {
-      twiml.message(
-        "Hmm, I couldn't find any expenses in that message.\n\nTry:\n• *200 rupees auto*\n• *500 groceries*\n• Multiple at once:\n  100 coffee, 299 netflix, 800 groceries"
-      );
-    } else {
-      // Upsert group
-      await supabase.from("groups").upsert({ id: groupId, name: groupId }, { onConflict: "id", ignoreDuplicates: true });
+    if (intent.intent === "delete") {
+      const reply = await handleDelete(intent, groupId);
+      twiml.message(reply);
 
-      // Insert all expenses
-      await supabase.from("transactions").insert(
-        expenses.map((e) => ({
-          group_id: groupId,
-          amount: e.amount,
-          description: e.description,
-          category: e.category,
-          paid_by: e.paid_by || "Unknown",
-          raw_message: incomingMsg,
-        }))
-      );
+    } else if (intent.intent === "edit") {
+      const reply = await handleEdit(intent, groupId);
+      twiml.message(reply);
 
-      // Fetch fresh totals + limits after insert
-      const { data: limits } = await supabase.from("limits").select("*").eq("group_id", groupId);
-      const { data: txns } = await supabase
-        .from("transactions")
-        .select("amount, category")
-        .eq("group_id", groupId)
-        .gte("created_at", new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString());
+    } else if (intent.intent === "show") {
+      const reply = await handleShow(intent, groupId);
+      twiml.message(reply);
 
-      const totalSpent = (txns || []).reduce((s, t) => s + t.amount, 0);
-      const overallLimit = (limits || []).find((l) => l.category === "overall");
+    } else if (intent.intent === "expense") {
+      const expenses = await parseExpenses(incomingMsg);
 
-      // Helper: total spent in a category this month
-      const catSpent = (cat) =>
-        (txns || []).filter((t) => t.category === cat).reduce((s, t) => s + t.amount, 0);
+      if (!expenses.length) {
+        twiml.message(
+          "Hmm, I couldn't find any expenses in that message.\n\nTry:\n• *200 rupees auto*\n• *500 groceries*\n• Multiple at once: 100 coffee, 299 netflix\n\nTo edit/delete: *edit last to 300* or *delete last*"
+        );
+      } else {
+        // Upsert group
+        await supabase.from("groups").upsert({ id: groupId, name: groupId }, { onConflict: "id", ignoreDuplicates: true });
 
-      // Build reply — one line per expense + category balance if limit exists
-      const lines = [];
-      const seenCats = new Set();
+        // Insert all expenses
+        await supabase.from("transactions").insert(
+          expenses.map((e) => ({
+            group_id: groupId,
+            amount: e.amount,
+            description: e.description,
+            category: e.category,
+            paid_by: e.paid_by || "Me",
+            raw_message: incomingMsg,
+          }))
+        );
 
-      for (const e of expenses) {
-        lines.push(`✅ *₹${e.amount.toLocaleString("en-IN")}* — ${e.description} (${e.category})`);
+        // Fetch fresh totals + limits after insert
+        const { data: limits } = await supabase.from("limits").select("*").eq("group_id", groupId);
+        const { data: txns } = await supabase
+          .from("transactions")
+          .select("amount, category")
+          .eq("group_id", groupId)
+          .gte("created_at", new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString());
 
-        // Show category balance once per unique category in this message
-        if (!seenCats.has(e.category)) {
-          seenCats.add(e.category);
-          const catLimit = (limits || []).find((l) => l.category === e.category);
-          if (catLimit) {
-            const spent = catSpent(e.category);
-            const rem = catLimit.amount - spent;
-            lines.push(
-              rem < 0
-                ? `   ⚠️ ${e.category} limit exceeded by ₹${Math.abs(rem).toLocaleString("en-IN")}`
-                : `   📊 ${e.category}: ₹${rem.toLocaleString("en-IN")} left of ₹${catLimit.amount.toLocaleString("en-IN")}`
-            );
+        const totalSpent = (txns || []).reduce((s, t) => s + t.amount, 0);
+        const overallLimit = (limits || []).find((l) => l.category === "overall");
+        const catSpent = (cat) =>
+          (txns || []).filter((t) => t.category === cat).reduce((s, t) => s + t.amount, 0);
+
+        const lines = [];
+        const seenCats = new Set();
+
+        for (const e of expenses) {
+          lines.push(`✅ *₹${e.amount.toLocaleString("en-IN")}* — ${e.description} (${e.category})`);
+          if (!seenCats.has(e.category)) {
+            seenCats.add(e.category);
+            const catLimit = (limits || []).find((l) => l.category === e.category);
+            if (catLimit) {
+              const spent = catSpent(e.category);
+              const rem = catLimit.amount - spent;
+              lines.push(
+                rem < 0
+                  ? `   ⚠️ ${e.category} limit exceeded by ₹${Math.abs(rem).toLocaleString("en-IN")}`
+                  : `   📊 ${e.category}: ₹${rem.toLocaleString("en-IN")} left of ₹${catLimit.amount.toLocaleString("en-IN")}`
+              );
+            }
           }
         }
+
+        if (expenses.length > 1) {
+          const totalThisMsg = expenses.reduce((s, e) => s + e.amount, 0);
+          lines.push(`\n📦 *${expenses.length} recorded* · This batch: ₹${totalThisMsg.toLocaleString("en-IN")}`);
+        }
+
+        if (overallLimit) {
+          const rem = overallLimit.amount - totalSpent;
+          lines.push(
+            rem < 0
+              ? `🚨 Monthly budget exceeded by ₹${Math.abs(rem).toLocaleString("en-IN")}`
+              : `💰 Monthly: ₹${totalSpent.toLocaleString("en-IN")} / ₹${overallLimit.amount.toLocaleString("en-IN")} · ₹${rem.toLocaleString("en-IN")} left`
+          );
+        }
+
+        twiml.message(lines.join("\n"));
       }
 
-      // Summary line for multi-expense messages
-      if (expenses.length > 1) {
-        const totalThisMsg = expenses.reduce((s, e) => s + e.amount, 0);
-        lines.push(`\n📦 *${expenses.length} recorded* · This batch: ₹${totalThisMsg.toLocaleString("en-IN")}`);
-      }
-
-      // Overall monthly budget
-      if (overallLimit) {
-        const rem = overallLimit.amount - totalSpent;
-        lines.push(
-          rem < 0
-            ? `🚨 Monthly budget exceeded by ₹${Math.abs(rem).toLocaleString("en-IN")}`
-            : `💰 Monthly: ₹${totalSpent.toLocaleString("en-IN")} / ₹${overallLimit.amount.toLocaleString("en-IN")} · ₹${rem.toLocaleString("en-IN")} left`
-        );
-      }
-
-      twiml.message(lines.join("\n"));
+    } else {
+      twiml.message(
+        "I didn't understand that.\n\nYou can:\n• Log expenses: *200 auto*, *500 groceries*\n• Edit last: *edit last to 300*\n• Edit field: *edit last category to Food*\n• Delete: *delete last*\n• See recent: *show last 5*"
+      );
     }
+
   } catch (err) {
     console.error("Webhook error:", err);
     twiml.message("Something went wrong. Please try again.");
