@@ -408,28 +408,68 @@ app.post("/webhook/sms", async (req, res) => {
     const signedAmount = parsed.refund ? -parsed.amount : parsed.amount;
     const description = parsed.refund ? `Refund: ${categorized.description}` : categorized.description;
 
-    await supabase.from("transactions").insert({
-      group_id: groupId,
-      amount: signedAmount,
-      description,
-      category: categorized.category,
-      paid_by: "Me",
-      raw_message: text,
+    const { data: transaction, error: insertError } = await supabase
+  .from("transactions")
+  .insert({
+    group_id: groupId,
+    amount: signedAmount,
+    description,
+    category: categorized.category,
+    paid_by: "Me",
+    raw_message: text,
+  })
+  .select("id")
+  .single();
+
+if (insertError) throw insertError;
+
+    // Send concise WhatsApp notification via Twilio
+let reply;
+
+if (
+  process.env.TWILIO_ACCOUNT_SID &&
+  process.env.TWILIO_AUTH_TOKEN &&
+  process.env.TWILIO_WHATSAPP_FROM &&
+  process.env.TWILIO_WHATSAPP_TO
+) {
+  const client = twilio(
+    process.env.TWILIO_ACCOUNT_SID,
+    process.env.TWILIO_AUTH_TOKEN
+  );
+
+  if (categorized.category === "Other") {
+    const { error: pendingError } = await supabase
+      .from("groups")
+      .update({
+        pending_category_txn_id: transaction.id,
+        awaiting_custom_category: false,
+      })
+      .eq("id", groupId);
+
+    if (pendingError) throw pendingError;
+
+    await client.messages.create({
+      from: process.env.TWILIO_WHATSAPP_FROM,
+      to: process.env.TWILIO_WHATSAPP_TO,
+      contentSid: process.env.TWILIO_LIST_PICKER_CONTENT_SID,
+      contentVariables: JSON.stringify({
+        "1": `₹${Math.abs(signedAmount).toLocaleString("en-IN")} - ${description}`,
+      }),
     });
 
-    // Build the reply message (same format as WhatsApp)
-    const expense = { amount: signedAmount, description, category: categorized.category };
-    const reply = await buildExpenseReply([expense], groupId);
+    reply = `Auto-logged ₹${Math.abs(signedAmount).toLocaleString("en-IN")} - Other. Category correction requested.`;
+  } else {
+    reply = `🏦 Auto-logged from bank SMS\n₹${Math.abs(signedAmount).toLocaleString("en-IN")}\nCategory: ${categorized.category}`;
 
-    // Send WhatsApp notification via Twilio
-    if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_WHATSAPP_FROM && process.env.TWILIO_WHATSAPP_TO) {
-      const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-      await client.messages.create({
-        from: process.env.TWILIO_WHATSAPP_FROM, // whatsapp:+14155238886
-        to: process.env.TWILIO_WHATSAPP_TO,     // whatsapp:+91XXXXXXXXXX
-        body: `🏦 *Auto-logged from bank SMS*\n\n${reply}`,
-      });
-    }
+    await client.messages.create({
+      from: process.env.TWILIO_WHATSAPP_FROM,
+      to: process.env.TWILIO_WHATSAPP_TO,
+      body: reply,
+    });
+  }
+} else {
+  reply = `₹${Math.abs(signedAmount).toLocaleString("en-IN")} - ${categorized.category}`;
+}
 
     res.json({
       recorded: true,
@@ -450,8 +490,9 @@ app.post("/webhook/sms", async (req, res) => {
 app.post("/webhook/whatsapp", async (req, res) => {
   const twiml = new twilio.twiml.MessagingResponse();
   const incomingMsg = (req.body.Body || "").trim();
+  console.log("WHATSAPP WEBHOOK PAYLOAD:", JSON.stringify(req.body));
   const from = req.body.From || "whatsapp:unknown";
-  const groupId = from.replace("whatsapp:", "").replace(/\D/g, "");
+  const groupId = process.env.DEFAULT_GROUP_ID || "utkarsh";
 
   try {
     const intent = await classifyIntent(incomingMsg);
