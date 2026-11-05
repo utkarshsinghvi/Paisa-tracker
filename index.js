@@ -13,7 +13,10 @@ app.use(cors({ origin: process.env.FRONTEND_URL || "*" }));
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
-// ── SMS Parser — handles HDFC CC, ICICI UPI, ICICI CC ─────────────────────
+// Payees ignored by the SMS parser (uppercase substrings)
+const SKIP_PAYEES = ["UTKARSH SINGHVI", "CRED CLUB"];
+
+// ── SMS Parser — HDFC/ICICI cards, UPI, UPI Lite, refunds & reversals ─────────────────────
 function parseSMS(text) {
   // Skip OTP messages entirely
   if (/\bOTP\b/i.test(text) || /one.?time.?pass/i.test(text)) {
@@ -23,6 +26,7 @@ function parseSMS(text) {
   let amount = null;
   let merchant = null;
   let source = null;
+  let refund = false;
 
   // ── HDFC Credit Card ──────────────────────────────────────────────────────
   // "Spent Rs.1729 On HDFC Bank Card 3604 At ZEPTO MARKETPLACE PRIV On 2026-10-19"
@@ -55,7 +59,60 @@ function parseSMS(text) {
     }
   }
 
+  // ── HDFC UPI ─────────────────────────────────────────────────────────────
+  // "Sent Rs.1.00 From HDFC Bank A/C *6264 To UTKARSH SINGHVI On 05/11/26 Ref ..."
+  if (!amount) {
+    const hdfcUPI = text.match(/Sent\s+Rs\.?\s*([\d,]+(?:\.\d+)?)\s+From\s+HDFC\s+Bank\s+A\/C\s+\*?\w+\s+To\s+([\s\S]+?)\s+On\s+\d{1,2}\/\d{1,2}\/\d{2,4}/i);
+    if (hdfcUPI) {
+      amount = parseFloat(hdfcUPI[1].replace(/,/g, ""));
+      merchant = hdfcUPI[2].trim();
+      source = "HDFC UPI";
+    }
+  }
+
+  // ── ICICI Credit Card (alternate wording) ────────────────────────────────
+  // "Rs 36,287.00 spent on ICICI Bank Card XX0000 on 30-Oct-26 at AMAZON PAY IN E. Avl Lmt..."
+  if (!amount) {
+    const m = text.match(/Rs\.?\s*([\d,]+(?:\.\d+)?)\s+spent\s+on\s+ICICI\s+Bank\s+Card\s+\w+\s+on\s+[\w-]+\s+at\s+(.+?)(?:\.\s|\.?\s*Avl|$)/i);
+    if (m) { amount = parseFloat(m[1].replace(/,/g, "")); merchant = m[2].trim(); source = "ICICI Card"; }
+  }
+
+  // ── HDFC Credit Card (no-OTP / autopay wording) ──────────────────────────
+  // "Amount Spent: Rs.119 with HDFC Bank Credit Card 3604 at SPOTIFYINDIA on 2026-09-26..."
+  if (!amount) {
+    const m = text.match(/Amount\s+Spent:\s*Rs\.?\s*([\d,]+(?:\.\d+)?)\s+with\s+HDFC\s+Bank\s+Credit\s+Card\s+\d+\s+at\s+(.+?)\s+on\s+\d{4}/i);
+    if (m) { amount = parseFloat(m[1].replace(/,/g, "")); merchant = m[2].trim(); source = "HDFC Card"; }
+  }
+
+  // ── ICICI UPI Lite (daily summary) ────────────────────────────────────────
+  // "You have carried out 1 transactions worth Rs 80 using your UPI Lite Wallet/s on 30-SEP-26"
+  if (!amount) {
+    const m = text.match(/carried\s+out\s+\d+\s+transactions?\s+worth\s+Rs\.?\s*([\d,]+(?:\.\d+)?)\s+using\s+your\s+UPI\s+Lite/i);
+    if (m) { amount = parseFloat(m[1].replace(/,/g, "")); merchant = "UPI Lite payments"; source = "ICICI UPI Lite"; }
+  }
+
+  // ── Refunds / reversals (logged as negative amounts) ─────────────────────
+  if (!amount) {
+    // HDFC: "Alert! Rs. 2063 refunded by PYU*MYNTRA DESIGNS PRI Bangalore     IND on 20/OCT/2026"
+    let m = text.match(/Rs\.?\s*([\d,]+(?:\.\d+)?)\s+refunded\s+by\s+(.+?)\s+on\s+\d{1,2}\//i);
+    if (m) { amount = parseFloat(m[1].replace(/,/g, "")); merchant = m[2].slice(0, 23).trim(); source = "HDFC Card refund"; refund = true; }
+    // HDFC: "Transaction Reversed!On HDFC Bank CREDIT Card xx3604 Amt: Rs.209.34 By UBER INDIA SYSTEMS On 2026-..."
+    if (!m) {
+      m = text.match(/Transaction\s+Reversed!.*?Amt:\s*Rs\.?\s*([\d,]+(?:\.\d+)?)\s+By\s+(.+?)\s+On\s+\d{4}/i);
+      if (m) { amount = parseFloat(m[1].replace(/,/g, "")); merchant = m[2].trim(); source = "HDFC Card reversal"; refund = true; }
+    }
+    // ICICI: "AMAZON PAY IN E COMMERC refund of Rs 2,099.00 credited to ICICI Bank Credit Card XX0000"
+    if (!m) {
+      m = text.match(/^(.+?)\s+refund\s+of\s+Rs\.?\s*([\d,]+(?:\.\d+)?)\s+credited\s+to\s+ICICI\s+Bank\s+Credit\s+Card/i);
+      if (m) { amount = parseFloat(m[2].replace(/,/g, "")); merchant = m[1].trim(); source = "ICICI Card refund"; refund = true; }
+    }
+  }
+
   if (!amount || !merchant) return null;
+
+  // Skip payees that aren't real spending (edit this list as needed):
+  // own-account transfers, and credit card bill payments (card spends are already logged individually)
+  if (SKIP_PAYEES.some((p) => merchant.toUpperCase().includes(p))) return null;
 
   // Clean up merchant name — remove trailing noise words
   merchant = merchant
@@ -66,7 +123,7 @@ function parseSMS(text) {
   // Truncate if too long
   if (merchant.length > 40) merchant = merchant.substring(0, 40).trim();
 
-  return { amount, merchant, source };
+  return { amount, merchant, source, refund };
 }
 
 // ── Classify message intent ────────────────────────────────────────────────
@@ -274,7 +331,11 @@ async function buildExpenseReply(expenses, groupId) {
   const seenCats = new Set();
 
   for (const e of expenses) {
-    lines.push(`✅ *₹${e.amount.toLocaleString("en-IN")}* — ${e.description} (${e.category})`);
+    lines.push(
+      e.amount < 0
+        ? `↩️ *₹${Math.abs(e.amount).toLocaleString("en-IN")} refund* — ${e.description} (${e.category})`
+        : `✅ *₹${e.amount.toLocaleString("en-IN")}* — ${e.description} (${e.category})`
+    );
     if (!seenCats.has(e.category)) {
       seenCats.add(e.category);
       const catLimit = (limits || []).find((l) => l.category === e.category);
@@ -344,17 +405,20 @@ app.post("/webhook/sms", async (req, res) => {
     );
 
     // Insert transaction
+    const signedAmount = parsed.refund ? -parsed.amount : parsed.amount;
+    const description = parsed.refund ? `Refund: ${categorized.description}` : categorized.description;
+
     await supabase.from("transactions").insert({
       group_id: groupId,
-      amount: parsed.amount,
-      description: categorized.description,
+      amount: signedAmount,
+      description,
       category: categorized.category,
       paid_by: "Me",
       raw_message: text,
     });
 
     // Build the reply message (same format as WhatsApp)
-    const expense = { amount: parsed.amount, description: categorized.description, category: categorized.category };
+    const expense = { amount: signedAmount, description, category: categorized.category };
     const reply = await buildExpenseReply([expense], groupId);
 
     // Send WhatsApp notification via Twilio
@@ -369,8 +433,8 @@ app.post("/webhook/sms", async (req, res) => {
 
     res.json({
       recorded: true,
-      amount: parsed.amount,
-      description: categorized.description,
+      amount: signedAmount,
+      description,
       category: categorized.category,
       source: parsed.source,
       reply,
