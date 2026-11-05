@@ -14,7 +14,7 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
 // Payees ignored by the SMS parser (uppercase substrings)
-const SKIP_PAYEES = ["UTKARSH SINGHVI", "CRED CLUB"];
+const INTERNAL_TRANSFER_PAYEES = ["UTKARSH SINGHVI"];
 
 // ── SMS Parser — HDFC/ICICI cards, UPI, UPI Lite, refunds & reversals ─────────────────────
 function parseSMS(text) {
@@ -112,7 +112,9 @@ function parseSMS(text) {
 
   // Skip payees that aren't real spending (edit this list as needed):
   // own-account transfers, and credit card bill payments (card spends are already logged individually)
-  if (SKIP_PAYEES.some((p) => merchant.toUpperCase().includes(p))) return null;
+  const isInternalTransfer = INTERNAL_TRANSFER_PAYEES.some(
+  (p) => merchant.toUpperCase().includes(p)
+);
 
   // Clean up merchant name — remove trailing noise words
   merchant = merchant
@@ -123,7 +125,7 @@ function parseSMS(text) {
   // Truncate if too long
   if (merchant.length > 40) merchant = merchant.substring(0, 40).trim();
 
-  return { amount, merchant, source, refund };
+  return { amount, merchant, source, refund, isInternalTransfer };
 }
 
 // ── Classify message intent ────────────────────────────────────────────────
