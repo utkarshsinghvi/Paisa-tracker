@@ -397,7 +397,11 @@ app.post("/webhook/sms", async (req, res) => {
   try {
     // Use Claude to get a clean description and category
     // Check whether this merchant/person has a previously saved category
-const merchantKey = parsed.merchant.toLowerCase().replace(/\s+/g, " ").trim();
+const merchantKey = parsed.merchant
+  .toLowerCase()
+  .replace(/\bstore\b/g, "")
+  .replace(/\s+/g, " ")
+  .trim();
 
 const { data: savedRule, error: savedRuleError } = await supabase
   .from("category_rules")
@@ -457,7 +461,18 @@ if (
     process.env.TWILIO_ACCOUNT_SID,
     process.env.TWILIO_AUTH_TOKEN
   );
+const categoryEmoji = {
+  Food: "🍔",
+  Transport: "🚕",
+  Shopping: "🛍️",
+  Entertainment: "🎬",
+  Health: "💊",
+  Bills: "🧾",
+  "Friends and family": "👥",
+  Other: "💳",
+};
 
+const emoji = categoryEmoji[categorized.category] || "💳";
   if (categorized.category === "Other") {
     const { error: pendingError } = await supabase
       .from("groups")
@@ -474,13 +489,14 @@ if (
       to: process.env.TWILIO_WHATSAPP_TO,
       contentSid: process.env.TWILIO_LIST_PICKER_CONTENT_SID,
       contentVariables: JSON.stringify({
-        "1": `₹${Math.abs(signedAmount).toLocaleString("en-IN")} - ${description}`,
-      }),
+  "1": `₹${Math.abs(signedAmount).toLocaleString("en-IN")}`,
+  "2": description,
+}),
     });
 
     reply = `Auto-logged ₹${Math.abs(signedAmount).toLocaleString("en-IN")} - Other. Category correction requested.`;
   } else {
-    reply = `🏦 Auto-logged from bank SMS\n₹${Math.abs(signedAmount).toLocaleString("en-IN")}\nCategory: ${categorized.category}`;
+    reply = `${emoji} Expense recorded\n\nAmount - ₹${Math.abs(signedAmount).toLocaleString("en-IN")}\nPayee - ${description}\nCategory - ${categorized.category}`;\n₹${Math.abs(signedAmount).toLocaleString("en-IN")}\nCategory: ${categorized.category}`;
 
     await client.messages.create({
       from: process.env.TWILIO_WHATSAPP_FROM,
@@ -565,9 +581,10 @@ if (pendingTxnError) throw pendingTxnError;
 
 if (pendingTxn?.description) {
   const merchantKey = pendingTxn.description
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .trim();
+  .toLowerCase()
+  .replace(/\bstore\b/g, "")
+  .replace(/\s+/g, " ")
+  .trim();
 
   const { error: ruleError } = await supabase
     .from("category_rules")
