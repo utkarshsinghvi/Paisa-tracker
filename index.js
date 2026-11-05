@@ -496,8 +496,7 @@ const emoji = categoryEmoji[categorized.category] || "💳";
 
     reply = `Auto-logged ₹${Math.abs(signedAmount).toLocaleString("en-IN")} - Other. Category correction requested.`;
   } else {
-    reply = `${emoji} Expense recorded\n\nAmount - ₹${Math.abs(signedAmount).toLocaleString("en-IN")}\nPayee - ${description}\nCategory - ${categorized.category}`;\n₹${Math.abs(signedAmount).toLocaleString("en-IN")}\nCategory: ${categorized.category}`;
-
+    reply = `${emoji} Expense recorded\n\nAmount - ₹${Math.abs(signedAmount).toLocaleString("en-IN")}\nPayee - ${description}\nCategory - ${categorized.category}`;
     await client.messages.create({
       from: process.env.TWILIO_WHATSAPP_FROM,
       to: process.env.TWILIO_WHATSAPP_TO,
