@@ -417,7 +417,12 @@ if (savedRuleError) throw savedRuleError;
 
 let categorized;
 
-if (savedRule) {
+if (parsed.isInternalTransfer) {
+  categorized = {
+    description: parsed.merchant,
+    category: "Internal Transfer",
+  };
+} else if (savedRule) {
   categorized = {
     description: parsed.merchant,
     category: savedRule.category,
@@ -425,7 +430,6 @@ if (savedRule) {
 } else {
   categorized = await categorizeMerchant(parsed.merchant, parsed.amount);
 }
-
     // Upsert group
     await supabase.from("groups").upsert(
       { id: groupId, name: groupId },
