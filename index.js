@@ -374,6 +374,7 @@ async function buildExpenseReply(expenses, groupId) {
 // Body: { "text": "<raw SMS text>", "group_id": "<your group id>", "secret": "<SMS_SECRET>" }
 // ══════════════════════════════════════════════════════════════════════════
 app.post("/webhook/sms", async (req, res) => {
+  console.log("SMS WEBHOOK BODY:", JSON.stringify(req.body));
   // Simple secret to prevent abuse
   const secret = req.body.secret || req.headers["x-sms-secret"];
   if (process.env.SMS_SECRET && secret !== process.env.SMS_SECRET) {
