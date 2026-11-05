@@ -396,7 +396,28 @@ app.post("/webhook/sms", async (req, res) => {
 
   try {
     // Use Claude to get a clean description and category
-    const categorized = await categorizeMerchant(parsed.merchant, parsed.amount);
+    // Check whether this merchant/person has a previously saved category
+const merchantKey = parsed.merchant.toLowerCase().replace(/\s+/g, " ").trim();
+
+const { data: savedRule, error: savedRuleError } = await supabase
+  .from("category_rules")
+  .select("category")
+  .eq("group_id", groupId)
+  .eq("merchant_key", merchantKey)
+  .maybeSingle();
+
+if (savedRuleError) throw savedRuleError;
+
+let categorized;
+
+if (savedRule) {
+  categorized = {
+    description: parsed.merchant,
+    category: savedRule.category,
+  };
+} else {
+  categorized = await categorizeMerchant(parsed.merchant, parsed.amount);
+}
 
     // Upsert group
     await supabase.from("groups").upsert(
@@ -533,6 +554,35 @@ app.post("/webhook/whatsapp", async (req, res) => {
         .eq("group_id", groupId);
 
       if (updateError) throw updateError;
+      const { data: pendingTxn, error: pendingTxnError } = await supabase
+  .from("transactions")
+  .select("description")
+  .eq("id", group.pending_category_txn_id)
+  .eq("group_id", groupId)
+  .maybeSingle();
+
+if (pendingTxnError) throw pendingTxnError;
+
+if (pendingTxn?.description) {
+  const merchantKey = pendingTxn.description
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const { error: ruleError } = await supabase
+    .from("category_rules")
+    .upsert(
+      {
+        group_id: groupId,
+        merchant_key: merchantKey,
+        category: listId,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: "group_id,merchant_key" }
+    );
+
+  if (ruleError) throw ruleError;
+}
 
       const { error: clearError } = await supabase
         .from("groups")
@@ -571,6 +621,35 @@ app.post("/webhook/whatsapp", async (req, res) => {
       .eq("group_id", groupId);
 
     if (updateError) throw updateError;
+    const { data: pendingTxn, error: pendingTxnError } = await supabase
+  .from("transactions")
+  .select("description")
+  .eq("id", pendingGroup.pending_category_txn_id)
+  .eq("group_id", groupId)
+  .maybeSingle();
+
+if (pendingTxnError) throw pendingTxnError;
+
+if (pendingTxn?.description) {
+  const merchantKey = pendingTxn.description
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const { error: ruleError } = await supabase
+    .from("category_rules")
+    .upsert(
+      {
+        group_id: groupId,
+        merchant_key: merchantKey,
+        category: customCategory,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: "group_id,merchant_key" }
+    );
+
+  if (ruleError) throw ruleError;
+}
 
     const { error: clearError } = await supabase
       .from("groups")
