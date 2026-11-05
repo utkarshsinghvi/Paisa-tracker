@@ -495,7 +495,97 @@ app.post("/webhook/whatsapp", async (req, res) => {
   const groupId = process.env.DEFAULT_GROUP_ID || "utkarsh";
 
   try {
-    const intent = await classifyIntent(incomingMsg);
+  const listId = (req.body.ListId || "").trim();
+
+  if (listId) {
+    const { data: group, error: groupError } = await supabase
+      .from("groups")
+      .select("pending_category_txn_id")
+      .eq("id", groupId)
+      .maybeSingle();
+
+    if (groupError) throw groupError;
+
+    if (!group?.pending_category_txn_id) {
+      twiml.message("No pending transaction found to update.");
+      return res.type("text/xml").send(twiml.toString());
+    }
+
+    if (listId === "Others") {
+      const { error } = await supabase
+        .from("groups")
+        .update({ awaiting_custom_category: true })
+        .eq("id", groupId);
+
+      if (error) throw error;
+
+      twiml.message("Please type your custom category (e.g. Shopping, Bills, Health).");
+      return res.type("text/xml").send(twiml.toString());
+    }
+
+    const allowedCategories = ["Food", "Transport", "Entertainment"];
+
+    if (allowedCategories.includes(listId)) {
+      const { error: updateError } = await supabase
+        .from("transactions")
+        .update({ category: listId })
+        .eq("id", group.pending_category_txn_id)
+        .eq("group_id", groupId);
+
+      if (updateError) throw updateError;
+
+      const { error: clearError } = await supabase
+        .from("groups")
+        .update({
+          pending_category_txn_id: null,
+          awaiting_custom_category: false,
+        })
+        .eq("id", groupId);
+
+      if (clearError) throw clearError;
+
+      twiml.message(`Transaction category updated to ${listId}.`);
+      return res.type("text/xml").send(twiml.toString());
+    }
+  }
+  const { data: pendingGroup, error: pendingGroupError } = await supabase
+    .from("groups")
+    .select("pending_category_txn_id, awaiting_custom_category")
+    .eq("id", groupId)
+    .maybeSingle();
+
+  if (pendingGroupError) throw pendingGroupError;
+
+  if (pendingGroup?.awaiting_custom_category && pendingGroup?.pending_category_txn_id) {
+    const customCategory = incomingMsg.trim();
+
+    if (!customCategory || customCategory.length > 40) {
+      twiml.message("Please enter a valid category (maximum 40 characters).");
+      return res.type("text/xml").send(twiml.toString());
+    }
+
+    const { error: updateError } = await supabase
+      .from("transactions")
+      .update({ category: customCategory })
+      .eq("id", pendingGroup.pending_category_txn_id)
+      .eq("group_id", groupId);
+
+    if (updateError) throw updateError;
+
+    const { error: clearError } = await supabase
+      .from("groups")
+      .update({
+        pending_category_txn_id: null,
+        awaiting_custom_category: false,
+      })
+      .eq("id", groupId);
+
+    if (clearError) throw clearError;
+
+    twiml.message(`Transaction category updated to ${customCategory}.`);
+    return res.type("text/xml").send(twiml.toString());
+  }
+  const intent = await classifyIntent(incomingMsg);
 
     if (intent.intent === "delete") {
       twiml.message(await handleDelete(intent, groupId));
