@@ -5,6 +5,7 @@ const cors = require("cors");
 const Anthropic = require("@anthropic-ai/sdk");
 const { createClient } = require("@supabase/supabase-js");
 const twilio = require("twilio");
+const classifier = require("./classifier");
 
 const app = express();
 
@@ -15,10 +16,28 @@ app.use(cors({ origin: process.env.FRONTEND_URL || "*" }));
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
-// Payees / senders ignored by the SMS parser (uppercase substrings).
-// Covers own-account transfers in BOTH directions (money sent to yourself, and
-// money received from yourself) plus credit card bill payments.
-const SKIP_PAYEES = ["UTKARSH SINGHVI", "CRED CLUB"];
+// ── User-specific knowledge for the classification engine ──────────────────
+// The engine (./classifier) knows no names, accounts or payees. Everything personal arrives through this object.
+// The defaults below reproduce the old hardcoded SKIP_PAYEES behaviour so nothing regresses; override them per
+// deployment with the RUVIO_USER_CONFIG env var (JSON). Per-user storage can replace getUserConfig() later
+// without touching the engine. Fields: ownNames, ownVpas, ownAccounts, ignorePayees, investmentPayees.
+const LEGACY_USER_CONFIG = {
+  ownNames: ["UTKARSH SINGHVI"],
+  ignorePayees: ["CRED CLUB"],
+  // Broker/platform names as banks print them (often truncated). Money to or from these is an investment, not spending or income.
+  investmentPayees: ["ZERODH", "GROWW"],
+};
+
+function getUserConfig(/* groupId */) {
+  if (process.env.RUVIO_USER_CONFIG) {
+    try {
+      return JSON.parse(process.env.RUVIO_USER_CONFIG);
+    } catch (err) {
+      console.error("RUVIO_USER_CONFIG is not valid JSON; using defaults:", err.message);
+    }
+  }
+  return LEGACY_USER_CONFIG;
+}
 
 // Emoji shown next to each category in WhatsApp messages (SMS + dictated flows)
 const CATEGORY_EMOJI = {
@@ -29,6 +48,7 @@ const CATEGORY_EMOJI = {
   Health: "💊",
   Bills: "🧾",
   "Friends and family": "👥",
+  Investments: "📈",
   Other: "💳",
 };
 
@@ -42,11 +62,14 @@ function formatINR(amount) {
   return `₹${Math.abs(Number(amount)).toLocaleString("en-IN")}`;
 }
 
-// Income rows are stored with transaction_type = "income".
-// Rows without the column (or created before it existed) are treated as expenses.
-function isIncome(txn) {
-  return txn && txn.transaction_type === "income";
-}
+// How a stored row is counted (see classifier/ledger.js):
+//   received   -> transaction_type "income"/"received" OR category "Received" (so it works before the optional column exists)
+//   investment -> category "Investments": tracked separately, never counted as spending
+//   spend      -> everything else (refunds are negative spend rows)
+const isIncome = classifier.isReceived;     // kept for existing call sites
+const isReceived = classifier.isReceived;
+const isInvestment = classifier.isInvestment;
+const isSpend = classifier.isSpend;
 
 // Key used to remember a merchant's category in the category_rules table
 function toMerchantKey(name) {
@@ -57,134 +80,12 @@ function toMerchantKey(name) {
     .trim();
 }
 
-// ── SMS Parser — HDFC/ICICI cards, UPI, UPI Lite, refunds, reversals & credits ──
+// ── SMS parsing — delegated to the classification engine (./classifier) ──────
+// Same return shape as the old regex parser; null when the message should not be recorded.
+// The full classification (income/refund/transfer/investment, confidence, review) is used by /webhook/sms below.
 
 function parseSMS(text) {
-  // Skip OTP messages entirely
-  if (/\bOTP\b/i.test(text) || /one.?time.?pass/i.test(text)) {
-    return null;
-  }
-
-  let amount = null;
-  let merchant = null;
-  let source = null;
-  let refund = false;
-  let type = "expense";
-  let account = null;
-  let reference = null;
-
-  // ── HDFC Credit Card ──────────────────────────────────────────────────────
-  // "Spent Rs.1729 On HDFC Bank Card 3604 At ZEPTO MARKETPLACE PRIV On 2026-10-19"
-  const hdfcCC = text.match(/Spent\s+Rs\.?([\d,]+(?:\.\d+)?)\s+On\s+HDFC\s+Bank\s+Card\s+(\d+)\s+At\s+(.+?)\s+On\s+\d{4}/i);
-  if (hdfcCC) {
-    amount = parseFloat(hdfcCC[1].replace(/,/g, ""));
-    merchant = hdfcCC[3].trim();
-    source = `HDFC Card ${hdfcCC[2]}`;
-  }
-
-  // ── ICICI UPI ─────────────────────────────────────────────────────────────
-  // "ICICI Bank Acct XX639 debited for Rs 129.00 on 17-Oct-26; NAGAMMA NAGAMMA credited."
-  if (!amount) {
-    const iciciBankUPI = text.match(/ICICI\s+Bank\s+Acct\s+\w+\s+debited\s+for\s+Rs\s+([\d,]+(?:\.\d+)?)\s+on\s+[\w-]+;\s+(.+?)\s+credited/i);
-    if (iciciBankUPI) {
-      amount = parseFloat(iciciBankUPI[1].replace(/,/g, ""));
-      merchant = iciciBankUPI[2].trim();
-      source = "ICICI UPI";
-    }
-  }
-
-  // ── ICICI Credit Card ─────────────────────────────────────────────────────
-  // "INR 125.00 spent using ICICI Bank Card XX0000 on 13-Oct-26 on AMAZON PAY IN G."
-  if (!amount) {
-    const iciciCC = text.match(/INR\s+([\d,]+(?:\.\d+)?)\s+spent\s+using\s+ICICI\s+Bank\s+Card\s+\w+\s+on\s+[\w-]+\s+on\s+(.+?)(?:\.|Avl|$)/i);
-    if (iciciCC) {
-      amount = parseFloat(iciciCC[1].replace(/,/g, ""));
-      merchant = iciciCC[2].trim();
-      source = "ICICI Card";
-    }
-  }
-
-  // ── HDFC UPI ─────────────────────────────────────────────────────────────
-  // "Sent Rs.1.00 From HDFC Bank A/C *6264 To UTKARSH SINGHVI On 05/11/26 Ref ..."
-  if (!amount) {
-    const hdfcUPI = text.match(/Sent\s+Rs\.?\s*([\d,]+(?:\.\d+)?)\s+From\s+HDFC\s+Bank\s+A\/C\s+\*?\w+\s+To\s+([\s\S]+?)\s+On\s+\d{1,2}\/\d{1,2}\/\d{2,4}/i);
-    if (hdfcUPI) {
-      amount = parseFloat(hdfcUPI[1].replace(/,/g, ""));
-      merchant = hdfcUPI[2].trim();
-      source = "HDFC UPI";
-    }
-  }
-
-  // ── ICICI Credit Card (alternate wording) ────────────────────────────────
-  // "Rs 36,287.00 spent on ICICI Bank Card XX0000 on 30-Oct-26 at AMAZON PAY IN E. Avl Lmt..."
-  if (!amount) {
-    const m = text.match(/Rs\.?\s*([\d,]+(?:\.\d+)?)\s+spent\s+on\s+ICICI\s+Bank\s+Card\s+\w+\s+on\s+[\w-]+\s+at\s+(.+?)(?:\.\s|\.?\s*Avl|$)/i);
-    if (m) { amount = parseFloat(m[1].replace(/,/g, "")); merchant = m[2].trim(); source = "ICICI Card"; }
-  }
-
-  // ── HDFC Credit Card (no-OTP / autopay wording) ──────────────────────────
-  // "Amount Spent: Rs.119 with HDFC Bank Credit Card 3604 at SPOTIFYINDIA on 2026-09-26..."
-  if (!amount) {
-    const m = text.match(/Amount\s+Spent:\s*Rs\.?\s*([\d,]+(?:\.\d+)?)\s+with\s+HDFC\s+Bank\s+Credit\s+Card\s+\d+\s+at\s+(.+?)\s+on\s+\d{4}/i);
-    if (m) { amount = parseFloat(m[1].replace(/,/g, "")); merchant = m[2].trim(); source = "HDFC Card"; }
-  }
-
-  // ── ICICI UPI Lite (daily summary) ────────────────────────────────────────
-  // "You have carried out 1 transactions worth Rs 80 using your UPI Lite Wallet/s on 30-SEP-26"
-  if (!amount) {
-    const m = text.match(/carried\s+out\s+\d+\s+transactions?\s+worth\s+Rs\.?\s*([\d,]+(?:\.\d+)?)\s+using\s+your\s+UPI\s+Lite/i);
-    if (m) { amount = parseFloat(m[1].replace(/,/g, "")); merchant = "UPI Lite payments"; source = "ICICI UPI Lite"; }
-  }
-
-  // ── Refunds / reversals (logged as negative amounts) ─────────────────────
-  if (!amount) {
-    // HDFC: "Alert! Rs. 2063 refunded by PYU*MYNTRA DESIGNS PRI Bangalore     IND on 20/OCT/2026"
-    let m = text.match(/Rs\.?\s*([\d,]+(?:\.\d+)?)\s+refunded\s+by\s+(.+?)\s+on\s+\d{1,2}\//i);
-    if (m) { amount = parseFloat(m[1].replace(/,/g, "")); merchant = m[2].slice(0, 23).trim(); source = "HDFC Card refund"; refund = true; }
-
-    // HDFC: "Transaction Reversed!On HDFC Bank CREDIT Card xx3604 Amt: Rs.209.34 By UBER INDIA SYSTEMS On 2026-..."
-    if (!m) {
-      m = text.match(/Transaction\s+Reversed!.*?Amt:\s*Rs\.?\s*([\d,]+(?:\.\d+)?)\s+By\s+(.+?)\s+On\s+\d{4}/i);
-      if (m) { amount = parseFloat(m[1].replace(/,/g, "")); merchant = m[2].trim(); source = "HDFC Card reversal"; refund = true; }
-    }
-
-    // ICICI: "AMAZON PAY IN E COMMERC refund of Rs 2,099.00 credited to ICICI Bank Credit Card XX0000"
-    if (!m) {
-      m = text.match(/^(.+?)\s+refund\s+of\s+Rs\.?\s*([\d,]+(?:\.\d+)?)\s+credited\s+to\s+ICICI\s+Bank\s+Credit\s+Card/i);
-      if (m) { amount = parseFloat(m[2].replace(/,/g, "")); merchant = m[1].trim(); source = "ICICI Card refund"; refund = true; }
-    }
-  }
-
-  // ── ICICI account credit — money received (INCOME) ──────────────────────
-  // "Dear Customer, Acct XX639 is credited with Rs 1.00 on 05-Nov-26 from HARIHARAN S. UPI:667573776024-ICICI Bank."
-  if (!amount && /ICICI/i.test(text)) {
-    const m = text.match(/Acct\s+(\w+)\s+is\s+credited\s+with\s+Rs\.?\s*([\d,]+(?:\.\d+)?)\s+on\s+[\w-]+\s+from\s+(.+?)\.?\s+UPI[:\s]*(\d+)/i);
-    if (m) {
-      amount = parseFloat(m[2].replace(/,/g, ""));
-      merchant = m[3].trim();
-      source = "ICICI UPI credit";
-      type = "income";
-      account = `ICICI A/c ${m[1]}`;
-      reference = m[4];
-    }
-  }
-
-  if (!amount || !merchant) return null;
-
-  // Skip payees/senders that aren't real spending or income (edit this list as needed):
-  // own-account transfers, and credit card bill payments (card spends are already logged individually)
-  if (SKIP_PAYEES.some((p) => merchant.toUpperCase().includes(p))) return null;
-
-  // Clean up merchant name — remove trailing noise words
-  merchant = merchant
-    .replace(/\s+(PRIV|PVT|LTD|INDIA|PRIVATE|SERVICES?|SOLUTIONS?|SERV)\.?\s*$/i, "")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  // Truncate if too long
-  if (merchant.length > 40) merchant = merchant.substring(0, 40).trim();
-
-  return { amount, merchant, source, refund, type, account, reference };
+  return classifier.parseLegacy(text, getUserConfig());
 }
 
 // ── WhatsApp sending (never throws — a failed message must not lose a saved transaction) ──
@@ -432,7 +333,7 @@ async function handleShow(intent, groupId) {
   const lines = txns.map((t, i) => {
     const date = new Date(t.transaction_date || t.created_at).toLocaleDateString("en-IN", { day: "numeric", month: "short" });
     if (isIncome(t)) {
-      return `${i + 1}. ${INCOME_EMOJI} *+₹${t.amount.toLocaleString("en-IN")}* — ${t.description} (Income) · ${date}`;
+      return `${i + 1}. ${INCOME_EMOJI} *+₹${t.amount.toLocaleString("en-IN")}* — ${t.description} (Received) · ${date}`;
     }
     return `${i + 1}. *₹${t.amount.toLocaleString("en-IN")}* — ${t.description} (${t.category}) · ${date}`;
   });
@@ -451,9 +352,11 @@ async function handleQuery(question, groupId) {
     supabase.from("limits").select("*").eq("group_id", groupId),
   ]);
 
-  // Expenses only for spending maths; income is reported separately
-  const txns = (allTxns || []).filter((t) => !isIncome(t));
-  const incomeTxns = (allTxns || []).filter(isIncome);
+  // Spending maths excludes received money and investments; both are reported separately
+  const txns = (allTxns || []).filter(isSpend);
+  const incomeTxns = (allTxns || []).filter(isReceived);
+  const investTxns = (allTxns || []).filter(isInvestment);
+  const investNet = investTxns.reduce((s, t) => s + t.amount, 0);
 
   if (!txns.length && !incomeTxns.length) return "No transactions found for this month yet.";
 
@@ -481,6 +384,9 @@ async function handleQuery(question, groupId) {
   const incomeInfo = incomeTxns.length
     ? `- Income received: ₹${Math.round(incomeTotal).toLocaleString("en-IN")} across ${incomeTxns.length} credits (${incomeTxns.slice(0, 10).map(t => `${t.description}: ₹${t.amount.toLocaleString("en-IN")}`).join(", ")})`
     : "- Income received: none recorded";
+  const investInfo = investTxns.length
+    ? `- Investments (net, NOT counted as spending): ₹${Math.round(investNet).toLocaleString("en-IN")} across ${investTxns.length} entries`
+    : "";
 
   const prompt = `You are a personal finance assistant. Answer this question about the user's finances concisely in 2-4 lines. Use ₹ for amounts. Be specific with numbers. Income is money received and is NOT spending.
 
@@ -489,6 +395,7 @@ This month's data:
 - By category: ${catSummary}
 - Top transactions: ${top10}
 ${incomeInfo}
+${investInfo}
 ${limitsInfo ? `- Budget limits: ${limitsInfo}` : ""}
 
 Question: ${question}
@@ -514,8 +421,8 @@ async function buildExpenseReply(expenses, groupId) {
     .eq("group_id", groupId)
     .gte("created_at", new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString());
 
-  // Budgets count expenses only
-  const txns = (monthTxns || []).filter((t) => !isIncome(t));
+  // Budgets count spending only (not received money, not investments)
+  const txns = (monthTxns || []).filter(isSpend);
 
   const totalSpent = txns.reduce((s, t) => s + t.amount, 0);
   const overallLimit = (limits || []).find((l) => l.category === "overall");
@@ -563,10 +470,106 @@ async function buildExpenseReply(expenses, groupId) {
   return lines.join("\n");
 }
 
+// ── Saving classified transactions ─────────────────────────────────────────
+
+// Optional columns added by migrations/001_additive_columns.sql. Until that migration is run, saves fall back to
+// the original columns so nothing breaks (received/investment rows are still recognised by their category).
+const OPTIONAL_TXN_COLUMNS = ["transaction_type", "reference_id"];
+const OPTIONAL_COLUMN_RETRY_MS = 10 * 60 * 1000;
+let optionalColumns = { missing: false, checkedAt: 0 };
+
+function isMissingColumnError(err) {
+  if (!err) return false;
+  return (
+    err.code === "PGRST204" ||
+    err.code === "42703" ||
+    /could not find the .* column|column .* does not exist|schema cache/i.test(err.message || "")
+  );
+}
+
+async function insertTransaction(row) {
+  const legacyRow = { ...row };
+  OPTIONAL_TXN_COLUMNS.forEach((c) => delete legacyRow[c]);
+
+  const skipFull = optionalColumns.missing && Date.now() - optionalColumns.checkedAt < OPTIONAL_COLUMN_RETRY_MS;
+  if (!skipFull) {
+    const full = await supabase.from("transactions").insert(row).select("id").single();
+    if (!full.error) {
+      optionalColumns = { missing: false, checkedAt: Date.now() };
+      return full;
+    }
+    if (!isMissingColumnError(full.error)) return full;
+    optionalColumns = { missing: true, checkedAt: Date.now() };
+    console.warn("transactions is missing optional columns (run migrations/001_additive_columns.sql). Saving without them:", full.error.message);
+  }
+  return supabase.from("transactions").insert(legacyRow).select("id").single();
+}
+
+// Existing rows the engine needs for reconciliation: same reference number, the identical SMS in the last 24h,
+// and (for refunds only) recent purchases to link against. Read-only; failures degrade to "no extra context".
+async function fetchKnownTransactions(groupId, normalized, needRefundCandidates) {
+  const rows = new Map();
+  const queries = [];
+
+  for (const ref of normalized.references.slice(0, 3)) {
+    queries.push(supabase.from("transactions").select("*").eq("group_id", groupId).ilike("raw_message", `%${ref}%`).limit(10));
+  }
+  const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+  queries.push(supabase.from("transactions").select("*").eq("group_id", groupId).eq("raw_message", normalized.raw.trim()).gte("created_at", since).limit(5));
+  if (needRefundCandidates) {
+    const from = new Date(Date.now() - 180 * 24 * 3600 * 1000).toISOString();
+    queries.push(supabase.from("transactions").select("*").eq("group_id", groupId).gt("amount", 0).gte("created_at", from).order("created_at", { ascending: false }).limit(300));
+  }
+
+  // Run the lookups in parallel: one round-trip of added latency, not one per query.
+  for (const res of await Promise.all(queries)) {
+    if (res && res.error) console.error("Reconciliation lookup failed:", res.error.message);
+    ((res && res.data) || []).forEach((r) => rows.set(r.id, r));
+  }
+  return [...rows.values()];
+}
+
+const summariseClassification = (r) => ({
+  type: r.type, subtype: r.subtype, direction: r.direction, confidence: r.confidence,
+  adapter: r.adapter, reasons: r.reasons, reference: r.reference, date: r.date,
+  ...(r.link ? { link: r.link } : {}),
+  ...(r.related && r.related.length ? { related: r.related } : {}),
+});
+
+const ignoreReason = (r) => {
+  if (r.type === "unknown" || r.type === "info") return "Not a recognised transaction SMS, an OTP, or an own-account transfer";
+  if (r.type === "duplicate") return "Duplicate: this SMS is already recorded";
+  if (r.type === "transfer") return "Transfer between your own accounts: not counted as spending or income";
+  if (r.type === "card_payment") return "Credit card bill payment: card purchases are recorded individually";
+  return "Not recorded";
+};
+
+async function notifyReview(r, text) {
+  const arrow = r.direction === "in" ? "received" : "paid";
+  const body =
+    `⚠️ Needs your review\n\nAmount - ${formatINR(r.amount)} (${arrow})\n` +
+    (r.counterparty ? `Party - ${r.counterparty}\n` : "") +
+    `Why - ${r.review ? r.review.reason : "Low confidence"}\n\n` +
+    `Not recorded. If it's yours, add it manually, e.g. *${Math.round(r.amount)} <what it was for>*.\n\n` +
+    `SMS: ${text.replace(/\s+/g, " ").slice(0, 140)}`;
+  return sendWhatsApp({ body });
+}
+
+async function notifyTransferPair(r) {
+  const k = r.related && r.related[0];
+  if (!k) return { sent: false };
+  const body =
+    `↔️ Looks like a transfer between your own accounts\n\nAmount - ${formatINR(r.amount)}\n` +
+    `Same reference as an earlier entry: ${k.description} (${formatINR(k.amount)}).\n\n` +
+    `This SMS was not counted. The earlier entry is still recorded: delete it if it isn't a real expense or income.`;
+  return sendWhatsApp({ body });
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // ── SMS WEBHOOK — called by iPhone Shortcut ────────────────────────────────
 // POST /webhook/sms
 // Body: { "text": "<raw SMS text>", "group_id": "<your group id>", "secret": "<SMS_SECRET>" }
+// Flow: classify (./classifier) -> reconcile with existing rows -> record | ignore | flag for review.
 // ══════════════════════════════════════════════════════════════════════════
 
 app.post("/webhook/sms", async (req, res) => {
@@ -583,120 +586,151 @@ app.post("/webhook/sms", async (req, res) => {
     return res.status(400).json({ error: "Missing text or group_id" });
   }
 
-  // Parse the SMS with regex first (fast, no API cost)
-  const parsed = parseSMS(text);
-
-  if (!parsed) {
-    return res.json({ recorded: false, reason: "Not a recognised transaction SMS, an OTP, or an own-account transfer" });
-  }
-
   try {
-    // Upsert group
-    await supabase.from("groups").upsert(
-      { id: groupId, name: groupId },
-      { onConflict: "id", ignoreDuplicates: true }
-    );
+    const userConfig = getUserConfig(groupId);
 
-    // ── INCOME (money received) ──────────────────────────────────────────
-    if (parsed.type === "income") {
-      const { data: incomeTxn, error: incomeError } = await supabase
-        .from("transactions")
-        .insert({
-          group_id: groupId,
-          amount: parsed.amount,
-          description: parsed.merchant,
-          category: "Income",
-          paid_by: "Me",
-          raw_message: text,
-          transaction_type: "income",
-        })
-        .select("id")
-        .single();
+    // Pass 1: no database. Anything clearly not a money movement returns immediately.
+    let result = classifier.classify(text, userConfig, { now: new Date() });
+    const NEEDS_CONTEXT = ["expense", "received", "refund", "investment"];
+    if (NEEDS_CONTEXT.includes(result.type)) {
+      // Pass 2: reconcile against existing rows (duplicates, own-account pairs, refund -> purchase link).
+      const known = await fetchKnownTransactions(groupId, result.normalized, result.type === "refund");
+      result = classifier.classify(text, userConfig, { now: new Date(), known });
+    }
+    const classification = summariseClassification(result);
 
-      if (incomeError) throw incomeError;
-
-      const reply =
-        `${INCOME_EMOJI} Income received\n\nAmount - ${formatINR(parsed.amount)}\nFrom - ${parsed.merchant}` +
-        (parsed.account ? `\nAccount - ${parsed.account}` : "");
-
-      const wa = await sendWhatsApp({ body: reply });
-
+    // ── Not recorded: informational, own transfer, card bill, duplicate ──
+    if (result.action === "ignore") {
+      let whatsapp;
+      if (result.type === "transfer" && result.subtype === "reference_pair") whatsapp = await notifyTransferPair(result);
       return res.json({
-        recorded: true,
-        type: "income",
-        id: incomeTxn.id,
-        amount: parsed.amount,
-        description: parsed.merchant,
-        category: "Income",
-        source: parsed.source,
-        reply,
+        recorded: false,
+        type: result.type,
+        reason: ignoreReason(result),
+        classification,
+        ...(result.type === "duplicate" ? { duplicate: true } : {}),
+        ...(whatsapp ? { whatsapp_sent: whatsapp.sent } : {}),
+      });
+    }
+
+    // ── Ambiguous: never force a guess. Flag it and let the user decide ──
+    if (result.action === "review") {
+      const wa = await notifyReview(result, text);
+      return res.json({
+        recorded: false,
+        needs_review: true,
+        reason: result.review.reason,
+        classification,
         whatsapp_sent: wa.sent,
         ...(wa.error ? { whatsapp_error: wa.error } : {}),
       });
     }
 
-    // ── EXPENSE ──────────────────────────────────────────────────────────
-    // Check whether this merchant/person has a previously saved category
-    const merchantKey = toMerchantKey(parsed.merchant);
+    // ── Record ──
+    await supabase.from("groups").upsert({ id: groupId, name: groupId }, { onConflict: "id", ignoreDuplicates: true });
 
-    const { data: savedRule, error: savedRuleError } = await supabase
-      .from("category_rules")
-      .select("category")
-      .eq("group_id", groupId)
-      .eq("merchant_key", merchantKey)
-      .maybeSingle();
+    const baseRow = {
+      group_id: groupId,
+      paid_by: "Me",
+      raw_message: text,
+      ...(result.reference ? { reference_id: result.reference } : {}),
+      ...(result.date ? { transaction_date: result.date } : {}),
+    };
+    const saved = (row) => insertTransaction({ ...baseRow, ...row });
+    const duplicateResponse = () =>
+      res.json({ recorded: false, duplicate: true, type: "duplicate", reason: ignoreReason({ type: "duplicate" }), classification });
 
-    if (savedRuleError) throw savedRuleError;
+    // Received money (credits from people, NEFT/IMPS/ACH credits)
+    if (result.type === "received") {
+      const { data: txn, error } = await saved({ amount: result.signedAmount, description: result.merchant, category: "Received", transaction_type: "received" });
+      if (error && error.code === "23505") return duplicateResponse();
+      if (error) throw error;
 
-    let categorized;
-    if (savedRule) {
-      categorized = { description: parsed.merchant, category: savedRule.category };
-    } else {
-      // Use Claude to get a clean description and category
-      categorized = await categorizeMerchant(parsed.merchant, parsed.amount);
+      const reply =
+        `${INCOME_EMOJI} Money received\n\nAmount - ${formatINR(result.amount)}\nFrom - ${result.merchant}` +
+        (result.account ? `\nAccount - ${result.account}` : "");
+      const wa = await sendWhatsApp({ body: reply });
+      return res.json({
+        recorded: true, type: "received", id: txn.id, amount: result.signedAmount, description: result.merchant,
+        category: "Received", source: result.source, reply, classification,
+        whatsapp_sent: wa.sent, ...(wa.error ? { whatsapp_error: wa.error } : {}),
+      });
     }
 
-    // Insert transaction
-    const signedAmount = parsed.refund ? -parsed.amount : parsed.amount;
-    const description = parsed.refund ? `Refund: ${categorized.description}` : categorized.description;
+    // Investments: own category, kept out of spending
+    if (result.type === "investment") {
+      const { data: txn, error } = await saved({ amount: result.signedAmount, description: result.merchant, category: "Investments", transaction_type: "investment" });
+      if (error && error.code === "23505") return duplicateResponse();
+      if (error) throw error;
 
-    const { data: transaction, error: insertError } = await supabase
-      .from("transactions")
-      .insert({
-        group_id: groupId,
-        amount: signedAmount,
-        description,
-        category: categorized.category,
-        paid_by: "Me",
-        raw_message: text,
-      })
-      .select("id")
-      .single();
+      const label = result.subtype === "purchase" ? "Investment" : result.subtype === "dividend" ? "Dividend / interest" : "Investment redemption";
+      const reply =
+        `${emojiFor("Investments")} ${label} recorded\n\nAmount - ${formatINR(result.amount)}\n${result.subtype === "purchase" ? "To" : "From"} - ${result.merchant}\n` +
+        `Category - Investments (not counted as spending or income)`;
+      const wa = await sendWhatsApp({ body: reply });
+      return res.json({
+        recorded: true, type: "investment", subtype: result.subtype, id: txn.id, amount: result.signedAmount, description: result.merchant,
+        category: "Investments", source: result.source, reply, classification,
+        whatsapp_sent: wa.sent, ...(wa.error ? { whatsapp_error: wa.error } : {}),
+      });
+    }
 
+    // Expenses and refunds
+    const isRefund = result.type === "refund";
+    let category;
+    let description;
+    if (isRefund && result.link) {
+      // Linked refund: offsets the original purchase, in the original's category
+      category = result.category;
+      description = `Refund: ${result.link.description}`;
+    } else {
+      // Check whether this merchant/person has a previously saved category, else ask Claude
+      const merchantKey = toMerchantKey(result.merchant);
+      const { data: savedRule, error: savedRuleError } = await supabase
+        .from("category_rules")
+        .select("category")
+        .eq("group_id", groupId)
+        .eq("merchant_key", merchantKey)
+        .maybeSingle();
+      if (savedRuleError) throw savedRuleError;
+
+      const categorized = savedRule
+        ? { description: result.merchant, category: savedRule.category }
+        : await categorizeMerchant(result.merchant, result.amount);
+      category = categorized.category;
+      description = isRefund ? `Refund: ${categorized.description}` : categorized.description;
+    }
+
+    const { data: transaction, error: insertError } = await saved({ amount: result.signedAmount, description, category });
+    if (insertError && insertError.code === "23505") return duplicateResponse();
     if (insertError) throw insertError;
 
-    // Send concise WhatsApp notification (List Picker if category is "Other")
-    const notification = await notifyExpense({
-      groupId,
-      txnId: transaction.id,
-      amount: signedAmount,
-      description,
-      category: categorized.category,
-    });
+    let notification;
+    if (isRefund) {
+      const reply =
+        `↩️ Refund recorded\n\nAmount - ${formatINR(result.amount)}\nFrom - ${description.replace(/^Refund: /, "")}\nCategory - ${category}` +
+        (result.link ? `\nOffsets an earlier purchase of ${formatINR(result.link.original_amount)}` : "");
+      const wa = await sendWhatsApp({ body: reply });
+      notification = { reply, whatsapp_sent: wa.sent, whatsapp_error: wa.error };
+    } else {
+      // Concise WhatsApp notification (List Picker if category is "Other")
+      notification = await notifyExpense({ groupId, txnId: transaction.id, amount: result.signedAmount, description, category });
+    }
 
     res.json({
       recorded: true,
-      type: "expense",
+      type: isRefund ? "refund" : "expense",
       id: transaction.id,
-      amount: signedAmount,
+      amount: result.signedAmount,
       description,
-      category: categorized.category,
-      source: parsed.source,
+      category,
+      source: result.source,
       reply: notification.reply,
+      classification,
+      ...(result.link ? { linked_txn_id: result.link.id } : {}),
       whatsapp_sent: notification.whatsapp_sent,
       ...(notification.whatsapp_error ? { whatsapp_error: notification.whatsapp_error } : {}),
     });
-
   } catch (err) {
     console.error("SMS webhook error:", err.message || err);
     res.status(500).json({ error: err.message });
@@ -727,7 +761,7 @@ async function clearPendingCategory(groupId) {
 // Dictated / manual entries have no bank SMS, so no rule is saved for them.
 function ruleKeyForTxn(txn) {
   const parsed = txn.raw_message ? parseSMS(txn.raw_message) : null;
-  if (!parsed || parsed.type === "income") return null;
+  if (!parsed || parsed.type === "income" || parsed.type === "investment") return null;
   return toMerchantKey(parsed.merchant) || null;
 }
 
@@ -1058,8 +1092,9 @@ app.get("/api/transactions", async (req, res) => {
 
   const rows = data || [];
   if (type === "all") return res.json(rows);
-  if (type === "income") return res.json(rows.filter(isIncome));
-  res.json(rows.filter((t) => !isIncome(t)));
+  if (type === "income" || type === "received") return res.json(rows.filter(isReceived));
+  if (type === "investment" || type === "investments") return res.json(rows.filter(isInvestment));
+  res.json(rows.filter(isSpend));
 });
 
 app.post("/api/transactions", async (req, res) => {
@@ -1124,9 +1159,10 @@ app.get("/api/summary", async (req, res) => {
     supabase.from("limits").select("*").eq("group_id", group_id),
   ]);
 
-  // Expense figures exclude income; income is returned separately (new fields)
-  const txns = (allTxns || []).filter((t) => !isIncome(t));
-  const incomeTxns = (allTxns || []).filter(isIncome);
+  // Spending figures exclude received money and investments; both are returned separately (additive fields)
+  const txns = (allTxns || []).filter(isSpend);
+  const incomeTxns = (allTxns || []).filter(isReceived);
+  const investTxns = (allTxns || []).filter(isInvestment);
 
   const total = txns.reduce((s, t) => s + t.amount, 0);
   const byCategory = {}, byPerson = {}, byDay = {};
@@ -1147,6 +1183,10 @@ app.get("/api/summary", async (req, res) => {
     count: txns.length,
     incomeTotal,
     incomeCount: incomeTxns.length,
+    receivedTotal: incomeTotal,
+    receivedCount: incomeTxns.length,
+    investmentTotal: investTxns.reduce((s, t) => s + t.amount, 0),   // net: purchases minus redemptions/dividends
+    investmentCount: investTxns.length,
   });
 });
 
