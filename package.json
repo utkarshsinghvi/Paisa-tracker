@@ -4,7 +4,7 @@
   "description": "WhatsApp expense tracker backend",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
+    "start": "node server.js",
     "dev": "nodemon index.js",
     "test": "node --test \"classifier/test/*.test.js\" \"test/*.test.js\"",
     "validate": "node classifier/scripts/validate-corpus.js"
